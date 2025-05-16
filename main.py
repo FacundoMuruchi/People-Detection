@@ -80,8 +80,6 @@ while flag:
                     # bounding boxes
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                    has_person = True
-
         # upload original frames
         _, raw_buffer = cv2.imencode('.jpg', raw_frame)
         raw_stream = io.BytesIO(raw_buffer.tobytes())
