@@ -1,24 +1,25 @@
+import io
 import boto3
 import cv2
-import os
-import credentials
+import uuid
+import logging
+from botocore.exceptions import ClientError
 
-# folders
-output_dir = 'data'
-output_dir_imgs = os.path.join(output_dir, 'imgs')
-output_dir_boxes = os.path.join(output_dir, 'boxes')
-output_dir_anns = os.path.join(output_dir, 'anns')
+# create aws clients
+reko = boto3.client('rekognition')
 
-# in case they don't exist
-os.makedirs(output_dir_imgs, exist_ok=True)
-os.makedirs(output_dir_anns, exist_ok=True)
-os.makedirs(output_dir_boxes, exist_ok=True)
+s3 = boto3.client('s3')
 
+# create s3 bucket
+bucket_name = f'aws-person-rekognition-{uuid.uuid4()}'
 
-# create aws rekognition client
-reko_client = boto3.client('rekognition',
-                           aws_access_key_id = credentials.access_key,
-                            aws_secret_access_key= credentials.secret_key)
+# create bucket
+try:
+    s3.create_bucket(Bucket=bucket_name)
+except ClientError as e:
+    logging.error(e)
+except s3.exceptions.BucketAlreadyExists as b:
+    logging.error(b)
 
 # target class
 target_class = 'Person'
@@ -36,8 +37,8 @@ while flag:
 
         frame_nmr += 1
 
-        # process 1 out of 3 frames
-        if frame_nmr % 3 != 0:
+        # process 1 out of 4 frames
+        if frame_nmr % 4 != 0:
             continue
 
         # save raw frames
@@ -51,44 +52,46 @@ while flag:
         frame_bytes = buffer.tobytes()
 
         # detect objects
-        response = reko_client.detect_labels(Image={'Bytes' : frame_bytes},
+        response = reko.detect_labels(Image={'Bytes' : frame_bytes},
                                             MinConfidence = 50)
 
-        ann_path = os.path.join(output_dir_anns, f'frame_{frame_nmr:06d}.txt')
+        anns_buffer = io.StringIO()
 
-        with open(ann_path, 'w') as f:
+        for label in response['Labels']:
 
-            for label in response['Labels']:
+            if label['Name'] == target_class:
 
-                if label['Name'] == target_class:
+                for instance_nmr in range(len(label['Instances'])):
+                    bound_box = label['Instances'][instance_nmr]['BoundingBox']
+                    x = bound_box['Left']
+                    y = bound_box['Top']
+                    w = bound_box['Width']
+                    h = bound_box['Height']
 
-                    for instance_nmr in range(len(label['Instances'])):
-                        bound_box = label['Instances'][instance_nmr]['BoundingBox']
-                        x = bound_box['Left']
-                        y = bound_box['Top']
-                        w = bound_box['Width']
-                        h = bound_box['Height']
+                    # write detections (anns)
+                    anns_buffer.write(f"0 {(x + w / 2)} {(y + h / 2)} {w} {h}\n")
 
-                        # write detections (anns)
-                        f.write('{} {} {} {} {}\n'.format(0,
-                                                          (x + w / 2),
-                                                          (y + h / 2),
-                                                          w,
-                                                          h))
+                    # convert to pixel coordinates
+                    x1 = int(x * W)
+                    y1 = int(y * H)
+                    x2 = int((x + w) * W)
+                    y2 = int((y + h) * H)
 
-                        # convert to pixel coordinates
-                        x1 = int(x * W)
-                        y1 = int(y * H)
-                        x2 = int((x + w) * W)
-                        y2 = int((y + h) * H)
+                    # bounding boxes
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-                        # bounding boxes
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    has_person = True
 
-        # save original frames
-        raw_frame_path = os.path.join(output_dir_imgs, f'frame_{frame_nmr:06d}.jpg')
-        cv2.imwrite(raw_frame_path, raw_frame)
+        # upload original frames
+        _, raw_buffer = cv2.imencode('.jpg', raw_frame)
+        raw_stream = io.BytesIO(raw_buffer.tobytes())
+        s3.upload_fileobj(raw_stream, bucket_name, f"imgs/frame_{frame_nmr:06d}.jpg")
 
-        # save frames with boxes
-        processed_frame_path = os.path.join(output_dir_boxes, f'frame_{frame_nmr:06d}.jpg')
-        cv2.imwrite(processed_frame_path, frame)
+        # upload processed frames
+        _, processed_buffer = cv2.imencode('.jpg', frame)
+        processed_stream = io.BytesIO(processed_buffer.tobytes())
+        s3.upload_fileobj(processed_stream, bucket_name, f"boxes/frame_{frame_nmr:06d}.jpg")
+
+        # upload annotations
+        anns_stream = io.BytesIO(anns_buffer.getvalue().encode('utf-8'))
+        s3.upload_fileobj(anns_stream, bucket_name, f"anns/frame_{frame_nmr:06d}.txt")
